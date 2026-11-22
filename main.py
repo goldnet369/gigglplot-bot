@@ -23,10 +23,15 @@ def make_story():
     topic = random.choice(TOPICS)
     prompt = (
         f"Write a short funny story about {topic} for a YouTube Short. "
-        "Between 90 and 110 words. Simple English, family friendly, "
-        "with a funny twist at the end. "
-        'Return only JSON like {"title": "...", "story": "..."}. '
-        "The title must be under 60 characters."
+        "Between 90 and 110 words. Simple English, family friendly. "
+        "Make it genuinely funny: open with a strong hook in the first sentence, "
+        "use short punchy sentences and some dialogue, escalate the absurdity step by step, "
+        "and end with a surprising punchline in the very last sentence. "
+        "No moral, no cliches, use specific silly details. "
+        'Return only JSON like {"title": "...", "story": "...", "description": "...", "tags": ["..."]}. '
+        "The title must be curiosity-driven and under 55 characters. "
+        "The description is one catchy sentence that teases the story without spoiling the punchline. "
+        "The tags are 8 short search keywords."
     )
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
@@ -45,7 +50,9 @@ def make_story():
                 if isinstance(data, list):
                     data = data[0]
                 print("model used:", model)
-                return data["title"].strip(), data["story"].strip()
+                tags = [str(t).strip() for t in data.get("tags", []) if str(t).strip()]
+                return (data["title"].strip(), data["story"].strip(),
+                        str(data.get("description", "")).strip(), tags)
             except Exception as e:
                 last = e
                 print("retry", model, attempt + 1, e)
@@ -88,13 +95,13 @@ def wrap(text, font, d, maxw):
     return lines
 
 
-def make_bg(c1, c2):
-    img = Image.new("RGB", (W, H))
+def make_bg(c1, c2, w=W, h=H):
+    img = Image.new("RGB", (w, h))
     d = ImageDraw.Draw(img)
-    for y in range(H):
-        t = y / H
+    for y in range(h):
+        t = y / h
         col = tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
-        d.line([(0, y), (W, y)], fill=col)
+        d.line([(0, y), (w, y)], fill=col)
     return img
 
 
@@ -111,6 +118,27 @@ def make_frame(bg, text, path):
                stroke_width=8, stroke_fill="black")
         y += 130
     img.save(path)
+
+
+def make_thumb(title, path="thumb.jpg"):
+    tw, th = 1280, 720
+    img = make_bg(*random.choice(PALETTES), w=tw, h=th)
+    d = ImageDraw.Draw(img)
+    d.text((tw // 2, 70), "GigglePlot", font=ImageFont.truetype(FONT, 56),
+           fill="white", anchor="mm", stroke_width=4, stroke_fill="black")
+    size = 110
+    while True:
+        font = ImageFont.truetype(FONT, size)
+        lines = wrap(title, font, d, tw - 140)
+        if len(lines) * (size + 20) <= th - 220 or size <= 60:
+            break
+        size -= 8
+    y = th // 2 + 40 - (len(lines) - 1) * (size + 20) // 2
+    for line in lines:
+        d.text((tw // 2, y), line, font=font, fill="yellow", anchor="mm",
+               stroke_width=8, stroke_fill="black")
+        y += size + 20
+    img.save(path, quality=90)
 
 
 def build_video(story):
@@ -132,7 +160,7 @@ def build_video(story):
                     "-b:a", "192k", "-shortest", "out.mp4"], check=True)
 
 
-def upload(title, story):
+def upload(title, story, desc, tags):
     creds = Credentials(
         None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -142,12 +170,23 @@ def upload(title, story):
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
     yt = build("youtube", "v3", credentials=creds)
+    all_tags = []
+    size = 0
+    for t in tags + ["funny", "shorts", "comedy", "story", "humor"]:
+        if t.lower() not in [x.lower() for x in all_tags] and size + len(t) < 400:
+            all_tags.append(t)
+            size += len(t) + 1
+    hashtags = " ".join("#" + t.replace(" ", "") for t in all_tags[:5])
+    description = (f"{desc}\n\n{story}\n\nNew funny stories every day. "
+                   f"Subscribe to GigglePlot!\n\n#shorts {hashtags}")
     body = {
         "snippet": {
-            "title": title[:90] + " #shorts",
-            "description": story + "\n\n#shorts #funny #story #comedy",
-            "tags": ["funny", "story", "shorts", "comedy", "humor"],
+            "title": title[:88] + " #shorts",
+            "description": description[:4900],
+            "tags": all_tags,
             "categoryId": "23",
+            "defaultLanguage": "en",
+            "defaultAudioLanguage": "en",
         },
         "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
     }
@@ -156,12 +195,20 @@ def upload(title, story):
     resp = None
     while resp is None:
         _, resp = req.next_chunk()
-    print("Uploaded:", resp["id"])
+    vid = resp["id"]
+    print("Uploaded:", vid)
+    try:
+        make_thumb(title)
+        yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(
+            "thumb.jpg", mimetype="image/jpeg")).execute()
+        print("Thumbnail set")
+    except Exception as e:
+        print("Thumbnail failed:", e)
 
 
 if __name__ == "__main__":
-    title, story = make_story()
+    title, story, desc, tags = make_story()
     print(title)
     print(story)
     build_video(story)
-    upload(title, story)
+    upload(title, story, desc, tags)
