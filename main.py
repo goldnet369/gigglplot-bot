@@ -1,4 +1,4 @@
-import os, json, random, subprocess, asyncio
+import os, json, random, subprocess, asyncio, time
 import requests
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont
@@ -6,7 +6,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-MODEL = "gemini-flash-latest"
+MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+          "gemini-2.5-flash-lite", "gemini-2.5-flash"]
 VOICES = ["en-US-AndrewNeural", "en-US-AriaNeural", "en-US-GuyNeural", "en-US-JennyNeural"]
 TOPICS = ["a clumsy cat", "a lazy office worker", "a school prank", "a confusing GPS",
           "a picky eater", "a grandma and technology", "a dog who thinks he is the boss",
@@ -27,15 +28,29 @@ def make_story():
         'Return only JSON like {"title": "...", "story": "..."}. '
         "The title must be under 60 characters."
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    r = requests.post(url, params={"key": os.environ["GEMINI_API_KEY"]}, json=body, timeout=90)
-    r.raise_for_status()
-    data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-    if isinstance(data, list):
-        data = data[0]
-    return data["title"].strip(), data["story"].strip()
+    last = None
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(3):
+            try:
+                r = requests.post(url, params={"key": os.environ["GEMINI_API_KEY"]},
+                                  json=body, timeout=90)
+                if r.status_code in (404, 400):
+                    print("skip model", model, r.status_code)
+                    break
+                r.raise_for_status()
+                data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+                if isinstance(data, list):
+                    data = data[0]
+                print("model used:", model)
+                return data["title"].strip(), data["story"].strip()
+            except Exception as e:
+                last = e
+                print("retry", model, attempt + 1, e)
+                time.sleep(10)
+    raise RuntimeError(f"All models failed: {last}")
 
 
 async def tts(text, path):
