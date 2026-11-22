@@ -6,7 +6,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-flash-latest"
 VOICES = ["en-US-AndrewNeural", "en-US-AriaNeural", "en-US-GuyNeural", "en-US-JennyNeural"]
 TOPICS = ["a clumsy cat", "a lazy office worker", "a school prank", "a confusing GPS",
           "a picky eater", "a grandma and technology", "a dog who thinks he is the boss",
