@@ -2,7 +2,7 @@ import os, json, math, random, subprocess, asyncio, time, wave
 import numpy as np
 import requests
 import edge_tts
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -73,14 +73,16 @@ def make_song(topic=None):
 # -------------------------------------------------------------------- voice
 async def tts_line(text, path):
     last = None
-    for v in VOICES:
-        try:
-            await edge_tts.Communicate(text, v, rate="-6%").save(path)
-            if os.path.getsize(path) > 1000:
-                return
-        except Exception as e:
-            last = e
-    raise RuntimeError(f"TTS failed: {last}")
+    for attempt in range(3):
+        for v in VOICES:
+            try:
+                await edge_tts.Communicate(text, v, rate="-8%").save(path)
+                if os.path.getsize(path) > 500:
+                    return
+            except Exception as e:
+                last = e
+        await asyncio.sleep(2)
+    raise RuntimeError(f"TTS failed for '{text}': {last}")
 
 
 def decode(path):
@@ -98,15 +100,112 @@ def trim(x):
     return x[a:b]
 
 
-def get_voices(lines):
-    voices = []
-    for i, line in enumerate(lines):
-        p = f"line{i}.mp3"
-        asyncio.run(tts_line(line, p))
-        v = trim(decode(p))
-        peak = float(np.max(np.abs(v))) or 1.0
-        voices.append(v / peak * 0.9)
-    return voices
+NOTES = {"C4": 261.63, "D4": 293.66, "E4": 329.63, "G4": 392.0, "A4": 440.0, "C5": 523.25}
+PATTERNS = [
+    ["E4", "E4", "G4", "G4", "A4", "G4", "E4", "G4"],
+    ["D4", "E4", "G4", "E4", "D4", "E4", "C4", "D4"],
+    ["G4", "G4", "A4", "G4", "E4", "D4", "E4", "G4"],
+    ["E4", "G4", "A4", "C5", "A4", "G4", "E4", "D4"],
+]
+LINE_PATTERN = [0, 1, 2, 3, 0, 1, 2, 1]
+
+
+def f0_est(x):
+    frame, hop = 1024, 256
+    win = np.hanning(frame)
+    lo, hi = SR // 500, SR // 120
+    vals = []
+    for s0 in range(0, max(1, len(x) - frame), hop):
+        seg = x[s0:s0 + frame]
+        if len(seg) < frame or float(np.sqrt(np.mean(seg ** 2))) < 0.03:
+            continue
+        sp = np.fft.rfft(seg * win, 2048)
+        r = np.fft.irfft(sp * np.conj(sp))[:frame]
+        r = r / (r[0] + 1e-9)
+        lag = lo + int(np.argmax(r[lo:hi]))
+        if r[lag] > 0.35:
+            vals.append(SR / lag)
+    return float(np.median(vals)) if vals else 250.0
+
+
+def sing_word(x, f_target, dur, tag):
+    x = x / (float(np.max(np.abs(x))) or 1.0) * 0.9
+    f0 = f0_est(x)
+    pitch = float(np.clip(f_target / f0, 0.55, 2.2))
+    r = float(np.clip(dur / (len(x) / SR), 0.7, 2.2))
+    wp = f"sw_{tag}.wav"
+    with wave.open(wp, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((np.clip(x, -1, 1) * 32000).astype(np.int16).tobytes())
+    outf = ["-f", "f32le", "-ac", "1", "-ar", str(SR), "-"]
+    try:
+        af = f"rubberband=tempo={1 / r:.4f}:pitch={pitch:.4f}:formant=preserved"
+        out = subprocess.check_output(["ffmpeg", "-v", "error", "-i", wp, "-af", af] + outf)
+    except Exception as e:
+        print("rubberband failed, fallback:", e)
+        t = 1.0 / (pitch * r)
+        chain = []
+        while t < 0.5:
+            chain.append("atempo=0.5")
+            t /= 0.5
+        while t > 2.0:
+            chain.append("atempo=2.0")
+            t /= 2.0
+        chain.append(f"atempo={t:.4f}")
+        af = f"asetrate={SR * pitch:.1f},aresample={SR}," + ",".join(chain)
+        out = subprocess.check_output(["ffmpeg", "-v", "error", "-i", wp, "-af", af] + outf)
+    y = np.frombuffer(out, dtype=np.float32).copy()
+    y = trim(y)
+    fade = min(len(y), int(0.04 * SR))
+    if fade > 0:
+        y[-fade:] *= np.linspace(1, 0, fade)
+    y = y / (float(np.max(np.abs(y))) or 1.0) * 0.9
+    print(f"word {tag}: f0 {f0:.0f} -> {f_target:.0f} Hz, stretch {r:.2f}")
+    return y
+
+
+def plan_line(line):
+    words = line.split()
+    n = len(words)
+    pos, prev = [], -0.5
+    for i in range(n):
+        p = max(prev + 0.5, round(i * 8.0 / n * 2) / 2)
+        pos.append(p)
+        prev = p
+    return words, pos
+
+
+async def tts_all(jobs):
+    sem = asyncio.Semaphore(5)
+
+    async def one(li, wi, w):
+        async with sem:
+            text = w.strip(".,!?;:\"\u201c\u201d") or w
+            await tts_line(text, f"w{li}_{wi}.mp3")
+
+    await asyncio.gather(*[one(*j) for j in jobs])
+
+
+def get_sung(lines):
+    plans = [plan_line(l) for l in lines]
+    jobs = [(li, wi, w) for li, (ws, _) in enumerate(plans) for wi, w in enumerate(ws)]
+    asyncio.run(tts_all(jobs))
+    result = []
+    for li, (ws, pos) in enumerate(plans):
+        pat = PATTERNS[LINE_PATTERN[li % len(LINE_PATTERN)]]
+        items = []
+        for wi, w in enumerate(ws):
+            x = trim(decode(f"w{li}_{wi}.mp3"))
+            f_t = NOTES[pat[wi % len(pat)]]
+            if li == len(lines) - 1 and wi == len(ws) - 1:
+                f_t = NOTES["C4"]
+            nxt = pos[wi + 1] if wi + 1 < len(ws) else 7.4
+            dur = max(0.4, (nxt - pos[wi]) * BEAT * (0.92 if wi + 1 < len(ws) else 1.0))
+            items.append((pos[wi], sing_word(x, f_t, dur, f"{li}_{wi}")))
+        result.append(items)
+    return result
 
 
 # -------------------------------------------------------------------- music
@@ -156,7 +255,7 @@ def synth_music(total_beats, seed):
         pattern.append(idx if rng.random() < 0.8 else -1)
     k, c, h = kick(), clap(rng), hat(rng)
     for b in range(int(total_beats)):
-        bar = (b // 4) % 4
+        bar = ((b - INTRO) // 4) % 4 if b >= INTRO else 0
         t = b * BEAT
         add(buf, k, t)
         if b % 4 in (1, 3):
@@ -166,26 +265,28 @@ def synth_music(total_beats, seed):
         add(buf, tone(roots[bar], BEAT * 0.95, "sine", 0.55, 3.0), t)
         for f in chords[bar]:
             add(buf, tone(f, BEAT * 0.4, "tri", 0.10, 9), t + 0.5 * BEAT)
-        for half in (0, 1):
-            note = pattern[((b % 8) * 2) + half]
-            if note >= 0:
-                add(buf, tone(penta[note], BEAT * 0.5, "sine", 0.22, 5), t + half * 0.5 * BEAT)
+        if b < INTRO or b >= total_beats - OUTRO:
+            for half in (0, 1):
+                note = pattern[((b % 8) * 2) + half]
+                if note >= 0:
+                    add(buf, tone(penta[note], BEAT * 0.5, "sine", 0.22, 5), t + half * 0.5 * BEAT)
     peak = float(np.max(np.abs(buf))) or 1.0
     return buf / peak
 
 
-def build_audio(voices, seed):
-    slots, beat = [], INTRO
-    for v in voices:
-        need = len(v) / SR / BEAT + 0.5
-        nb = max(4, int(2 * math.ceil(need / 2)))
-        slots.append((beat, nb, v))
-        beat += nb
-    total_beats = beat + OUTRO
+def build_audio(sung, seed):
+    total_beats = INTRO + 8 * len(sung) + OUTRO
     music = synth_music(total_beats, seed)
     voice = np.zeros_like(music)
-    for beat, nb, v in slots:
-        add(voice, v, beat * BEAT + 0.25 * BEAT)
+    onsets = []
+    for li, items in enumerate(sung):
+        b0 = INTRO + 8 * li
+        ons = []
+        for pos, y in items:
+            t = max(0.0, (b0 + pos) * BEAT - 0.03)
+            add(voice, y, t)
+            ons.append(t)
+        onsets.append(ons)
     mix = music * 0.42 + voice * 0.95
     mix = np.tanh(mix * 1.2) / np.tanh(1.2)
     with wave.open("mix.wav", "wb") as w:
@@ -193,14 +294,16 @@ def build_audio(voices, seed):
         w.setsampwidth(2)
         w.setframerate(SR)
         w.writeframes((np.clip(mix, -1, 1) * 32000).astype(np.int16).tobytes())
-    return slots, total_beats, voice
+    return onsets, total_beats, voice
 
 
 # ---------------------------------------------------------------- character
-def draw_giggy(mouth=0.3, hand=0, spark=False):
+def draw_giggy(mouth=0.3, hand=0, spark=False, eyes="open"):
     S = 1280
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
+    cx, cy, rx, ry = 640, 560, 385, 350
+    RED, DRED = (225, 32, 40), (170, 20, 28)
     # feet
     for x in (480, 800):
         d.ellipse((x - 85, 1150, x + 85, 1245), fill=WHITE, outline=INK, width=14)
@@ -211,21 +314,30 @@ def draw_giggy(mouth=0.3, hand=0, spark=False):
         up = (hand == 0) if i == 0 else (hand == 1)
         y = 800 if up else 940
         d.ellipse((x - 100, y - 100, x + 100, y + 100), fill=WHITE, outline=INK, width=14)
+    # cap bill (behind the head, sticking out on the right)
+    bill = [(930, 330), (1115, 372), (1105, 462), (925, 410)]
+    d.polygon(bill, fill=RED)
+    d.line(bill + [bill[0]], fill=INK, width=14, joint="curve")
     # head
-    cx, cy, rx, ry = 640, 560, 385, 350
     d.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=WHITE, outline=INK, width=14)
     # cheeks
     for x in (420, 860):
-        d.ellipse((x - 70, 580, x + 70, 670), fill=(248, 160, 165))
-    # eyes (happy arcs)
-    for x in (470, 810):
-        d.arc((x - 85, 440, x + 85, 580), 200, 340, fill=INK, width=26)
+        d.ellipse((x - 70, 585, x + 70, 675), fill=(248, 160, 165))
+    # eyes
+    for i, x in enumerate((470, 810)):
+        closed = eyes == "blink" or (eyes == "wink" and i == 1)
+        if closed:
+            d.arc((x - 85, 450, x + 85, 590), 200, 340, fill=INK, width=24)
+        else:
+            d.ellipse((x - 44, 450, x + 44, 565), fill=INK)
+            d.ellipse((x - 4, 475, x + 28, 509), fill="white")
+            d.ellipse((x - 30, 530, x - 12, 548), fill="white")
     # mouth
-    my = 610
+    my = 625
     if mouth < 0.1:
-        d.arc((500, 560, 780, 740), 25, 155, fill=INK, width=20)
+        d.arc((500, 575, 780, 755), 25, 155, fill=INK, width=20)
     else:
-        h = int(40 + 170 * mouth)
+        h = int(40 + 160 * mouth)
         m = Image.new("L", (S, S), 0)
         ImageDraw.Draw(m).pieslice((640 - 140, my - h, 640 + 140, my + h), 0, 180, fill=255)
         layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
@@ -238,20 +350,30 @@ def draw_giggy(mouth=0.3, hand=0, spark=False):
         d = ImageDraw.Draw(img)
         d.arc((640 - 140, my - h, 640 + 140, my + h), 0, 180, fill=INK, width=12)
         d.line((640 - 140, my, 640 + 140, my), fill=INK, width=12)
-    # cap
-    cap = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    cd = ImageDraw.Draw(cap)
-    RED, DRED = (225, 32, 40), (170, 20, 28)
-    cd.polygon([(870, 250), (1080, 300), (1090, 380), (900, 340)], fill=RED, outline=INK)
-    cd.line([(870, 250), (1080, 300), (1090, 380), (900, 340), (870, 250)], fill=INK, width=14, joint="curve")
-    cd.pieslice((640 - 350, 70, 640 + 350, 70 + 480), 180, 360, fill=RED, outline=INK, width=14)
-    cd.line((640 - 350, 310, 640 + 350, 310), fill=INK, width=14)
-    cd.rounded_rectangle((560, 120, 760, 190), 20, fill=DRED, outline=INK, width=8)
-    for x in (600, 660, 720):
-        cd.ellipse((x - 9, 148, x + 9, 166), fill=(255, 205, 190))
-    cap = cap.rotate(-17, resample=Image.BICUBIC, center=(640, 320))
-    img.alpha_composite(cap, dest=(0, 38))
+    # cap on the head: red part of an ellipse hugging the head, cut by a tilted line
+    def hp(shift):
+        y0 = 345 + shift
+        k = math.tan(math.radians(10))
+        return [(0, y0 - 640 * k), (S, y0 + 640 * k), (S, 0), (0, 0)]
+
+    def shape(grow, shift):
+        e = Image.new("L", (S, S), 0)
+        ImageDraw.Draw(e).ellipse((cx - rx - grow, cy - ry - 70 - grow,
+                                   cx + rx + grow, cy + ry + 10 + grow), fill=255)
+        h_ = Image.new("L", (S, S), 0)
+        ImageDraw.Draw(h_).polygon(hp(shift), fill=255)
+        return ImageChops.multiply(e, h_)
+
+    ink = Image.new("RGBA", (S, S), INK + (255,))
+    ink.putalpha(shape(26, 14))
+    img.alpha_composite(ink)
+    red = Image.new("RGBA", (S, S), RED + (255,))
+    red.putalpha(shape(12, 0))
+    img.alpha_composite(red)
     d = ImageDraw.Draw(img)
+    d.rounded_rectangle((565, 215, 745, 272), 18, fill=DRED, outline=INK, width=8)
+    for x in (610, 655, 700):
+        d.ellipse((x - 9, 233, x + 9, 251), fill=(255, 205, 190))
     # sparkles
     if spark:
         gold = (255, 205, 55)
@@ -318,10 +440,11 @@ def layout(text, font, d):
 
 
 def make_video(title, lines):
-    voices = get_voices(lines)
+    sung = get_sung(lines)
     seed = random.randrange(10 ** 6)
-    slots, total_beats, voice = build_audio(voices, seed)
-    n_frames = int(total_beats * BEAT * FPS)
+    onsets, total_beats, voice = build_audio(sung, seed)
+    total_t = total_beats * BEAT
+    n_frames = int(total_t * FPS)
     spf = SR // FPS
     rms = np.array([np.sqrt(np.mean(voice[i * spf:(i + 1) * spf] ** 2) + 1e-12)
                     for i in range(n_frames)])
@@ -354,27 +477,32 @@ def make_video(title, lines):
          "-c:a", "aac", "-b:a", "160k", "-shortest", "out.mp4"],
         stdin=subprocess.PIPE)
 
+    wink_from = total_t - 1.6
     for f in range(n_frames):
         t = f / FPS
         bp = t / BEAT
         phase = bp % 1.0
         img = sky[(f // 2) % len(sky)].copy()
         d = ImageDraw.Draw(img)
-        # notes
         for i, (ch, x, off) in enumerate(notes):
             y = 840 - ((t * 70 + off) % 760)
             d.text((x + 14 * math.sin(t * 2 + i), y), ch, font=fn, fill=ncols[i],
                    stroke_width=5, stroke_fill=INK)
-        # channel name
         d.text((VW // 2, 62), "GigglePlot", font=fs, fill="white", anchor="mm",
                stroke_width=5, stroke_fill=INK)
-        # character
+        winking = t >= wink_from
+        if winking:
+            eyes = "wink"
+        elif (t % 3.4) < 0.14:
+            eyes = "blink"
+        else:
+            eyes = "open"
         mq = round(min(1.0, mouth_env[f]) * 6) / 6
         hand = int(bp) % 2
-        spark = phase < 0.45
-        key = (mq, hand, spark)
+        spark = phase < 0.45 or winking
+        key = (mq, hand, spark, eyes)
         if key not in cache:
-            cache[key] = draw_giggy(mq, hand, spark)
+            cache[key] = draw_giggy(mq, hand, spark, eyes)
         h = 4 * phase * (1 - phase)
         sx, sy = 1.06 - 0.10 * h, 0.93 + 0.12 * h
         g = cache[key].resize((int(640 * sx), int(640 * sy)), Image.BILINEAR)
@@ -383,21 +511,18 @@ def make_video(title, lines):
         d.ellipse((VW // 2 - shadow_w // 2, 862, VW // 2 + shadow_w // 2, 892), fill=(62, 160, 90))
         img.paste(g, (VW // 2 - g.width // 2, int(868 - g.height + 38 - 46 * h)), g)
         # lyrics
-        text, prog, key2 = None, 0.0, None
+        text, key2, k = None, None, 0
         if bp < INTRO:
             text, key2 = title, "title"
         elif bp >= total_beats - OUTRO:
             text, key2 = "Bye bye!", "bye"
         else:
-            for i, (b0, nb, v) in enumerate(slots):
-                if b0 <= bp < b0 + nb:
-                    text, key2 = lines[i], i
-                    vs = b0 * BEAT + 0.25 * BEAT
-                    prog = min(1.0, max(0.0, (t - vs) / (len(v) / SR)))
-                    break
+            li = int((bp - INTRO) // 8)
+            li = min(li, len(lines) - 1)
+            text, key2 = lines[li], li
+            k = sum(1 for o in onsets[li] if o <= t)
         if text:
             lay = get_layout(key2, text)
-            k = int(prog * len(lay) + 0.999) if prog > 0 else 0
             y0 = 985
             for j, (w, x, y) in enumerate(lay):
                 col = (255, 224, 70) if j < k else (255, 255, 255)
